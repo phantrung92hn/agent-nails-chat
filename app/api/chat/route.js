@@ -6,7 +6,7 @@ import {
   cancelBookingByTime,
   getBookingHistory,
   formatCustomerForPrompt,
-} from "../../lib/customerService.js";
+} from "../../../lib/customerService.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FIX A1: System Prompt dùng đúng `system` parameter
