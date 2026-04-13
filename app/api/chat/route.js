@@ -1,3 +1,13 @@
+
+import {
+  findCustomerByPhone,
+  upsertCustomer,
+  createBooking,
+  cancelBookingByTime,
+  getBookingHistory,
+  formatCustomerForPrompt,
+} from "../../lib/customerService.js";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FIX A1: System Prompt dùng đúng `system` parameter
 // FIX A2: Timezone động — tự tính CET/CEST theo ngày thực tế
@@ -51,7 +61,7 @@ function getBerlinOffset(date = new Date()) {
  * Tạo System Prompt với lịch trống được inject từ Google Calendar (live data).
  * @param {string} availabilityText - Text dạng "Lisa: Mo14 09:00,09:30|..."
  */
-function buildSystemPrompt(availabilityText) {
+function buildSystemPrompt(availabilityText, customerPromptText = "AKTUELLER KUNDE: Unbekannt") {
   return `Du bist der KI-Assistent für "Sakura Nails Hamburg" (Eppendorfer Baum 26, 20249 Hamburg).
 
 REGELN:
@@ -79,12 +89,7 @@ Mai(T03): Pediküre,Spa,Klassisch,Gel|4.8⭐|Deutsch+Vietn.+Engl.|Mo-Fr 10-18,Sa
 
 {{AVAILABILITY_PLACEHOLDER}}
 
-BUCHUNGEN:
-NK001 Sarah Müller 017612345678 Lisa GelMani+NailArt Mo14 09:00 43€(Stammkundin,Nude,Acetone-Allergie,120Punkte)
-NK002 Julia Schmidt 015798765432 Mai SpaPedi Di15 10:00 55€(Dunkelrot,50Punkte)
-
-STAMMKUNDEN:
-Sarah 017612345678: Lisa,Nude/Pastel,Acetone-Allergie,120Pkt|Julia 015798765432: Mai,Dunkelrot,50Pkt|Thomas 017699887766: keine Präf,30Pkt
+{{CUSTOMER_PLACEHOLDER}}
 
 TREUE: 1€=1Pkt|100=NailArt gratis|200=15€Rabatt|300=SpaPedi gratis
 
@@ -108,7 +113,8 @@ Regeln für das Tag:
 
 Wenn ein Termin storniert wird (Kunde bestätigt Stornierung mit J), füge hinzu:
 [CANCEL:techId=T01,date=2026-04-14,time=09:00]`
-    .replace("{{AVAILABILITY_PLACEHOLDER}}", availabilityText);
+    .replace("{{AVAILABILITY_PLACEHOLDER}}", availabilityText)
+    .replace("{{CUSTOMER_PLACEHOLDER}}", customerPromptText);
 }
 
 const GREETING =
@@ -154,8 +160,39 @@ export async function POST(request) {
       }
     }
 
-    // Inject availability thực vào System Prompt
-    const SYSTEM_PROMPT = buildSystemPrompt(availabilityText);
+    // ─────────────────────────────────────────────────────────────────────────
+    // OPTION C: Lookup khách hàng theo SĐT — inject vào System Prompt
+    // Chatbot tự extract SĐT từ tin nhắn gần nhất nếu khách vừa báo
+    // ─────────────────────────────────────────────────────────────────────────
+    let customerPromptText = "AKTUELLER KUNDE: Unbekannt (Telefonnummer noch nicht angegeben)";
+
+    // Tìm SĐT trong toàn bộ conversation (khách có thể đã báo trước đó)
+    const allText = messages.map((m) => m.content).join(" ");
+    const phoneMatch = allText.match(
+      /(?:(?:\+49|0049|0)[\s\-]?)?(?:1[5-7][0-9])[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{4,6}/
+    );
+
+    if (phoneMatch) {
+      try {
+        const customerUrl = new URL("/api/customer", request.url);
+        customerUrl.searchParams.set("phone", phoneMatch[0]);
+        const customerRes = await fetch(customerUrl.href, { method: "GET" });
+        const customerData = await customerRes.json();
+
+        if (customerData.found) {
+          customerPromptText = customerData.promptText;
+        } else {
+          // Số điện thoại mới — ghi chú để Claude hỏi tên
+          customerPromptText = `AKTUELLER KUNDE: Neue Nummer ${phoneMatch[0]} (noch nicht registriert — bitte Namen erfragen)`;
+        }
+      } catch (custErr) {
+        console.warn("⚠️  Customer lookup failed:", custErr.message);
+        // Không crash — chỉ không có customer context
+      }
+    }
+
+    // Inject cả availability + customer vào System Prompt
+    const SYSTEM_PROMPT = buildSystemPrompt(availabilityText, customerPromptText);
 
     // ─────────────────────────────────────────────────────────────────────────
     // FIX A1: Truyền System Prompt đúng cách qua `system` parameter
@@ -236,6 +273,46 @@ export async function POST(request) {
           });
           const bookData = await bookRes.json();
           console.log("✅ Calendar booked:", bookData.message);
+
+          // ── OPTION C: Lưu booking vào Supabase ───────────────────────────
+          if (bookData.success) {
+            try {
+              // Tìm hoặc tạo khách hàng
+              const customerName = bookMatch[5];
+              const phoneInText  = allText.match(
+                /(?:(?:\+49|0049|0)[\s\-]?)?(?:1[5-7][0-9])[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{4,6}/
+              );
+
+              if (phoneInText) {
+                let customer = await findCustomerByPhone(phoneInText[0]);
+                if (!customer) {
+                  customer = await upsertCustomer({
+                    phone: phoneInText[0],
+                    name:  customerName,
+                  });
+                }
+
+                // Tạo booking record
+                const techMap = { T01: "+4900000000001", T02: "+4900000000002", T03: "+4900000000003" };
+                const apptISO = new Date(`${bookMatch[2]}T${bookMatch[3]}:00+02:00`).toISOString();
+
+                await createBooking({
+                  customerId:    customer.id,
+                  technicianId:  bookMatch[1],
+                  service:       bookMatch[6],
+                  appointmentAt: apptISO,
+                  durationMin:   parseInt(bookMatch[4]),
+                  priceEur:      parseFloat(bookMatch[6].match(/(\d+)€/)?.[1] || "0"),
+                  gcalEventId:   bookData.eventId || null,
+                });
+                console.log("✅ Supabase booking saved for:", customerName);
+              }
+            } catch (dbErr) {
+              // DB error không được làm hỏng UX — chỉ log
+              console.error("❌ Supabase booking save failed:", dbErr.message);
+            }
+          }
+          // ─────────────────────────────────────────────────────────────────
         } catch (calErr) {
           console.error("❌ Calendar booking failed:", calErr.message);
         }
@@ -268,6 +345,21 @@ export async function POST(request) {
           });
           const cancelData = await cancelRes.json();
           console.log("✅ Calendar cancelled:", cancelData.message);
+
+          // ── OPTION C: Cập nhật trạng thái booking trong Supabase ─────────
+          if (cancelData.success) {
+            try {
+              const apptISO = new Date(`${cancelMatch[2]}T${cancelMatch[3]}:00+02:00`).toISOString();
+              await cancelBookingByTime({
+                technicianId:  cancelMatch[1],
+                appointmentAt: apptISO,
+              });
+              console.log("✅ Supabase booking cancelled");
+            } catch (dbErr) {
+              console.error("❌ Supabase cancel failed:", dbErr.message);
+            }
+          }
+          // ─────────────────────────────────────────────────────────────────
         } catch (calErr) {
           console.error("❌ Calendar cancel failed:", calErr.message);
         }
