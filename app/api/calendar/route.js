@@ -6,16 +6,58 @@ const TECHNICIANS = {
   T03: { name: "Mai", calendarId: process.env.CALENDAR_MAI },
 };
 
+function parseServiceAccountValue(rawServiceAccount) {
+  const trimmed = rawServiceAccount.trim();
+  let decoded = trimmed;
+
+  if (!trimmed.startsWith("{")) {
+    decoded = Buffer.from(trimmed, "base64").toString("utf-8");
+  }
+
+  return JSON.parse(decoded);
+}
+
 function getCalendarClient() {
-  // Decode toàn bộ service account JSON từ Base64
-  const serviceAccount = JSON.parse(
-    Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT, "base64").toString("utf-8")
-  );
+  let serviceAccount;
+
+  if (process.env.GOOGLE_SERVICE_ACCOUNT) {
+    try {
+      serviceAccount = parseServiceAccountValue(process.env.GOOGLE_SERVICE_ACCOUNT);
+    } catch (error) {
+      console.error("Failed to parse GOOGLE_SERVICE_ACCOUNT:", error.message);
+    }
+  }
+
+  if (!serviceAccount) {
+    const client_email = process.env.GOOGLE_SERVICE_ACCOUNT_CLIENT_EMAIL;
+    const private_key = process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY;
+
+    if (client_email && private_key) {
+      serviceAccount = {
+        client_email,
+        private_key,
+      };
+    }
+  }
+
+  if (!serviceAccount) {
+    throw new Error(
+      "Google service account is not configured. Set GOOGLE_SERVICE_ACCOUNT or both GOOGLE_SERVICE_ACCOUNT_CLIENT_EMAIL and GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY."
+    );
+  }
+
+  if (!serviceAccount.client_email || !serviceAccount.private_key) {
+    throw new Error(
+      "Service account data must include client_email and private_key."
+    );
+  }
 
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: serviceAccount.client_email,
-      private_key: serviceAccount.private_key,
+      private_key: serviceAccount.private_key.startsWith("-----BEGIN PRIVATE KEY-----")
+        ? serviceAccount.private_key.replace(/\\n/g, "\n")
+        : `-----BEGIN PRIVATE KEY-----\n${serviceAccount.private_key.replace(/\\n/g, "\n")}\n-----END PRIVATE KEY-----\n`,
     },
     scopes: ["https://www.googleapis.com/auth/calendar"],
   });
