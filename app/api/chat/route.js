@@ -1,8 +1,31 @@
+// ─────────────────────────────────────────────
+// FIX A1: System Prompt dùng đúng `system` parameter
+// FIX A2: Timezone động — tự tính CET/CEST theo ngày thực tế
+// FIX A3: Timestamp tin nhắn lưu đúng lúc gửi (xử lý ở frontend)
+// ─────────────────────────────────────────────
 
+/**
+ * Trả về offset múi giờ Berlin dưới dạng chuỗi "+HH:MM"
+ * Berlin dùng CET (UTC+1) mùa đông, CEST (UTC+2) mùa hè.
+ * Quy tắc EU: chuyển mùa hè vào Chủ nhật cuối tháng 3,
+ *             chuyển mùa đông vào Chủ nhật cuối tháng 10.
+ */
+function getBerlinOffset(date = new Date()) {
+  // Dùng Intl để lấy offset chính xác — không bao giờ sai dù DST
+  const berlinFormatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Berlin",
+    timeZoneName: "shortOffset",
+  });
+  const parts = berlinFormatter.formatToParts(date);
+  const offsetPart = parts.find((p) => p.type === "timeZoneName")?.value ?? "GMT+2";
+  // offsetPart ví dụ: "GMT+2" hoặc "GMT+1"
+  const match = offsetPart.match(/GMT([+-]\d+)/);
+  if (!match) return "+02:00";
+  const hours = parseInt(match[1]);
+  return hours >= 0 ? `+0${hours}:00` : `-0${Math.abs(hours)}:00`;
+}
 
-export async function POST(request) {
-  const { messages } = await request.json();
-  const SYSTEM_PROMPT = `Du bist der KI-Assistent für "Sakura Nails Hamburg" (Eppendorfer Baum 26, 20249 Hamburg).
+const SYSTEM_PROMPT = `Du bist der KI-Assistent für "Sakura Nails Hamburg" (Eppendorfer Baum 26, 20249 Hamburg).
 
 REGELN:
 - Deutsch antworten (Vietnamesisch/Englisch wenn Kunde so schreibt)
@@ -62,17 +85,40 @@ Regeln für das Tag:
 Wenn ein Termin storniert wird (Kunde bestätigt Stornierung mit J), füge hinzu:
 [CANCEL:techId=T01,date=2026-04-14,time=09:00]`;
 
-  const GREETING = "Hallo! Willkommen bei Sakura Nails Hamburg 💅\nWie kann ich dir helfen?\n\n1️⃣ Termin buchen\n2️⃣ Termin ändern oder stornieren\n3️⃣ Services & Preise ansehen\n4️⃣ Treuepunkte checken\n5️⃣ Etwas anderes\n\nTippe einfach die Zahl 😊";
+const GREETING =
+  "Hallo! Willkommen bei Sakura Nails Hamburg 💅\nWie kann ich dir helfen?\n\n1️⃣ Termin buchen\n2️⃣ Termin ändern oder stornieren\n3️⃣ Services & Preise ansehen\n4️⃣ Treuepunkte checken\n5️⃣ Etwas anderes\n\nTippe einfach die Zahl 😊";
+
+export async function POST(request) {
+  const { messages } = await request.json();
+
+  // ─── Validate input ────────────────────────────────────────────────────────
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return Response.json({ error: "Invalid messages format" }, { status: 400 });
+  }
 
   try {
-    // ─────────────────────────────────────────────
-    // Gọi Claude API
-    // ─────────────────────────────────────────────
-    const apiMessages = [
-      { role: "user", content: SYSTEM_PROMPT },
-      { role: "assistant", content: GREETING },
-      ...messages.slice(1),
-    ];
+    // ─────────────────────────────────────────────────────────────────────────
+    // FIX A1: Truyền System Prompt đúng cách qua `system` parameter
+    // Trước đây: nhét vào { role: "user" } → Claude xử lý như tin nhắn thường,
+    //           dễ bị override, tốn token hơn, context không tối ưu.
+    // Bây giờ:  dùng `system` riêng → Claude hiểu đây là chỉ thị cố định.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Lọc chỉ lấy messages hợp lệ (role: user | assistant), bỏ greeting tĩnh
+    // vì greeting đã được inject ở frontend — không cần gửi lại lên API
+    const apiMessages = messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .filter((m) => typeof m.content === "string" && m.content.trim() !== "");
+
+    // Đảm bảo conversation bắt đầu bằng role "user" (yêu cầu của Anthropic API)
+    // Nếu message đầu là greeting của assistant, bỏ đi
+    const firstUserIdx = apiMessages.findIndex((m) => m.role === "user");
+    const cleanMessages = firstUserIdx >= 0 ? apiMessages.slice(firstUserIdx) : apiMessages;
+
+    // Fallback nếu không có tin nhắn nào từ user
+    if (cleanMessages.length === 0) {
+      return Response.json({ reply: GREETING });
+    }
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -84,7 +130,8 @@ Wenn ein Termin storniert wird (Kunde bestätigt Stornierung mit J), füge hinzu
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 1024,
-        messages: apiMessages,
+        system: SYSTEM_PROMPT,   // ✅ FIX A1: đúng vị trí
+        messages: cleanMessages,
       }),
     });
 
