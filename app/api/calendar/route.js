@@ -7,10 +7,17 @@ const TECHNICIANS = {
 };
 
 function getCalendarClient() {
+  // Xử lý private key — Vercel có thể encode ký tự \n khác nhau
+  let privateKey = process.env.GOOGLE_PRIVATE_KEY || "";
+  // Trường hợp 1: key có literal \n (2 ký tự \ và n)
+  privateKey = privateKey.replace(/\\n/g, "\n");
+  // Trường hợp 2: key bị wrap trong dấu ngoặc kép thừa
+  privateKey = privateKey.replace(/^"/, "").replace(/"$/, "");
+  
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+      private_key: privateKey,
     },
     scopes: ["https://www.googleapis.com/auth/calendar"],
   });
