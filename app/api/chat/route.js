@@ -1,8 +1,30 @@
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // FIX A1: System Prompt dùng đúng `system` parameter
 // FIX A2: Timezone động — tự tính CET/CEST theo ngày thực tế
 // FIX A3: Timestamp tin nhắn lưu đúng lúc gửi (xử lý ở frontend)
-// ─────────────────────────────────────────────
+// OPTION B: Real-time availability — inject lịch trống thực từ Google Calendar
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Cache đơn giản để không gọi Calendar API mỗi tin nhắn
+// TTL: 5 phút — đủ fresh mà không gây latency cao
+const availabilityCache = {
+  data: null,
+  fetchedAt: 0,
+  TTL_MS: 5 * 60 * 1000, // 5 phút
+
+  isValid() {
+    return this.data !== null && (Date.now() - this.fetchedAt) < this.TTL_MS;
+  },
+
+  set(text) {
+    this.data = text;
+    this.fetchedAt = Date.now();
+  },
+
+  get() {
+    return this.data;
+  },
+};
 
 /**
  * Trả về offset múi giờ Berlin dưới dạng chuỗi "+HH:MM"
@@ -25,7 +47,12 @@ function getBerlinOffset(date = new Date()) {
   return hours >= 0 ? `+0${hours}:00` : `-0${Math.abs(hours)}:00`;
 }
 
-const SYSTEM_PROMPT = `Du bist der KI-Assistent für "Sakura Nails Hamburg" (Eppendorfer Baum 26, 20249 Hamburg).
+/**
+ * Tạo System Prompt với lịch trống được inject từ Google Calendar (live data).
+ * @param {string} availabilityText - Text dạng "Lisa: Mo14 09:00,09:30|..."
+ */
+function buildSystemPrompt(availabilityText) {
+  return `Du bist der KI-Assistent für "Sakura Nails Hamburg" (Eppendorfer Baum 26, 20249 Hamburg).
 
 REGELN:
 - Deutsch antworten (Vietnamesisch/Englisch wenn Kunde so schreibt)
@@ -50,10 +77,7 @@ Lisa(T01): Gel,Shellac,NailArt,Babyboomer|4.9⭐|Deutsch+Vietn.|Mo,Di,Do,Fr,Sa(M
 Anna(T02): Gel,Acryl,Verlängerung|4.7⭐|Deutsch+Engl.|Mo-Do,Fr bis 15(Sa frei)
 Mai(T03): Pediküre,Spa,Klassisch,Gel|4.8⭐|Deutsch+Vietn.+Engl.|Mo-Fr 10-18,Sa
 
-TERMINE(April 2026):
-Lisa: Mo14 09:00,10:30,13:00,15:00|Di15 09:00,11:00,14:00|Do17 09:00,10:00,13:30|Sa19 09:00,11:00,14:00
-Anna: Mo14 09:00,11:00,14:00|Di15 09:00,13:00,15:00|Mi16 10:00,12:00,14:30|Do17 09:00,11:30,14:00
-Mai: Mo14 10:00,12:00,14:30|Di15 10:00,13:00|Mi16 10:00,12:30,14:00|Do17 10:00,11:30,14:00|Sa19 09:00,11:30
+{{AVAILABILITY_PLACEHOLDER}}
 
 BUCHUNGEN:
 NK001 Sarah Müller 017612345678 Lisa GelMani+NailArt Mo14 09:00 43€(Stammkundin,Nude,Acetone-Allergie,120Punkte)
@@ -83,7 +107,9 @@ Regeln für das Tag:
 - Das Tag muss in der LETZTEN Zeile stehen
 
 Wenn ein Termin storniert wird (Kunde bestätigt Stornierung mit J), füge hinzu:
-[CANCEL:techId=T01,date=2026-04-14,time=09:00]`;
+[CANCEL:techId=T01,date=2026-04-14,time=09:00]`
+    .replace("{{AVAILABILITY_PLACEHOLDER}}", availabilityText);
+}
 
 const GREETING =
   "Hallo! Willkommen bei Sakura Nails Hamburg 💅\nWie kann ich dir helfen?\n\n1️⃣ Termin buchen\n2️⃣ Termin ändern oder stornieren\n3️⃣ Services & Preise ansehen\n4️⃣ Treuepunkte checken\n5️⃣ Etwas anderes\n\nTippe einfach die Zahl 😊";
@@ -97,6 +123,40 @@ export async function POST(request) {
   }
 
   try {
+    // ─────────────────────────────────────────────────────────────────────────
+    // OPTION B: Fetch lịch trống thực từ Google Calendar
+    // Dùng in-memory cache 5 phút để tránh gọi Calendar API mỗi tin nhắn
+    // ─────────────────────────────────────────────────────────────────────────
+    let availabilityText;
+
+    if (availabilityCache.isValid()) {
+      // Cache còn hợp lệ — dùng luôn, không gọi API
+      availabilityText = availabilityCache.get();
+    } else {
+      try {
+        // Gọi internal availability endpoint (cùng server)
+        const availUrl = new URL("/api/availability", request.url);
+        const availRes = await fetch(availUrl.href, { method: "GET" });
+        const availData = await availRes.json();
+
+        if (availData.success && availData.availabilityText) {
+          availabilityText = availData.availabilityText;
+          availabilityCache.set(availabilityText); // Lưu vào cache
+          console.log("📅 Availability fetched from Calendar");
+        } else {
+          throw new Error(availData.error || "Availability fetch failed");
+        }
+      } catch (availErr) {
+        // Nếu Calendar không available → dùng fallback text
+        console.warn("⚠️  Calendar unavailable, using fallback:", availErr.message);
+        availabilityText =
+          "FREIE TERMINE: (Kalender nicht verfügbar – bitte Salon anrufen: 040-12345678)";
+      }
+    }
+
+    // Inject availability thực vào System Prompt
+    const SYSTEM_PROMPT = buildSystemPrompt(availabilityText);
+
     // ─────────────────────────────────────────────────────────────────────────
     // FIX A1: Truyền System Prompt đúng cách qua `system` parameter
     // Trước đây: nhét vào { role: "user" } → Claude xử lý như tin nhắn thường,
