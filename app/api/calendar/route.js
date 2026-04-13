@@ -1,5 +1,34 @@
 import { google } from "googleapis";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX A2: Timezone động — Berlin dùng CEST (UTC+2) mùa hè, CET (UTC+1) mùa đông
+// Dùng Intl API thay vì hardcode "+02:00" để không bao giờ sai DST
+// ─────────────────────────────────────────────────────────────────────────────
+function getBerlinOffset(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Berlin",
+    timeZoneName: "shortOffset",
+  });
+  const parts = formatter.formatToParts(date);
+  const offsetStr = parts.find((p) => p.type === "timeZoneName")?.value ?? "GMT+2";
+  const match = offsetStr.match(/GMT([+-])(\d+)/);
+  if (!match) return "+02:00";
+  const sign = match[1];
+  const hours = match[2].padStart(2, "0");
+  return `${sign}${hours}:00`;
+}
+
+/**
+ * Tạo chuỗi datetime ISO đúng múi giờ Berlin.
+ * @param {string} date - "YYYY-MM-DD"
+ * @param {string} time - "HH:MM"
+ * @returns {string} ISO string với offset Berlin chính xác
+ */
+function toBerlinISOString(date, time) {
+  const offset = getBerlinOffset(new Date(`${date}T${time}:00`));
+  return `${date}T${time}:00${offset}`;
+}
+
 const TECHNICIANS = {
   T01: { name: "Lisa", calendarId: process.env.CALENDAR_LISA },
   T02: { name: "Anna", calendarId: process.env.CALENDAR_ANNA },
@@ -35,6 +64,172 @@ function getCalendarClient() {
     if (client_email && private_key) {
       serviceAccount = {
         client_email,
+        private_key,
+      };
+    }
+  }
+
+  if (!serviceAccount) {
+    throw new Error(
+      "Google service account is not configured. Set GOOGLE_SERVICE_ACCOUNT or both GOOGLE_SERVICE_ACCOUNT_CLIENT_EMAIL and GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY."
+    );
+  }
+
+  if (!serviceAccount.client_email || !serviceAccount.private_key) {
+    throw new Error(
+      "Service account data must include client_email and private_key."
+    );
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: serviceAccount.client_email,
+      private_key: serviceAccount.private_key.startsWith("-----BEGIN PRIVATE KEY-----")
+        ? serviceAccount.private_key.replace(/\\n/g, "\n")
+        : `-----BEGIN PRIVATE KEY-----\n${serviceAccount.private_key.replace(/\\n/g, "\n")}\n-----END PRIVATE KEY-----\n`,
+    },
+    scopes: ["https://www.googleapis.com/auth/calendar"],
+  });
+  return google.calendar({ version: "v3", auth });
+}
+
+export async function POST(request) {
+  const body = await request.json();
+  const { action, techId, date, time, duration, customerName, service } = body;
+
+  const calendar = getCalendarClient();
+  const tech = TECHNICIANS[techId];
+
+  if (!tech || !tech.calendarId) {
+    return Response.json(
+      { error: `Designerin ${techId} nicht gefunden` },
+      { status: 400 }
+    );
+  }
+
+  try {
+    if (action === "check_availability") {
+      const startOfDay = new Date(toBerlinISOString(date, "00:00"));
+      const endOfDay = new Date(toBerlinISOString(date, "23:59"));
+
+      const events = await calendar.events.list({
+        calendarId: tech.calendarId,
+        timeMin: startOfDay.toISOString(),
+        timeMax: endOfDay.toISOString(),
+        singleEvents: true,
+        orderBy: "startTime",
+        timeZone: "Europe/Berlin",
+      });
+
+      const busySlots = (events.data.items || []).map((e) => ({
+        start: e.start.dateTime,
+        end: e.end.dateTime,
+        summary: e.summary,
+      }));
+
+      return Response.json({
+        success: true,
+        technician: tech.name,
+        date,
+        busySlots,
+      });
+    }
+
+    if (action === "book") {
+      const startTime = new Date(toBerlinISOString(date, time));
+      const endTime = new Date(startTime.getTime() + (duration || 60) * 60000);
+
+      const event = await calendar.events.insert({
+        calendarId: tech.calendarId,
+        requestBody: {
+          summary: `💅 ${customerName} — ${service}`,
+          description: [
+            `Kundin: ${customerName}`,
+            `Service: ${service}`,
+            `Designerin: ${tech.name}`,
+            `Dauer: ${duration} Minuten`,
+            ``,
+            `Gebucht über Sakura Nails Chatbot`,
+          ].join("\n"),
+          start: {
+            dateTime: startTime.toISOString(),
+            timeZone: "Europe/Berlin",
+          },
+          end: {
+            dateTime: endTime.toISOString(),
+            timeZone: "Europe/Berlin",
+          },
+          colorId: "6",
+          reminders: {
+            useDefault: false,
+            overrides: [
+              { method: "popup", minutes: 120 },
+              { method: "popup", minutes: 15 },
+            ],
+          },
+        },
+      });
+
+      return Response.json({
+        success: true,
+        eventId: event.data.id,
+        message: `Termin gebucht: ${customerName} bei ${tech.name}, ${date} um ${time}`,
+      });
+    }
+
+    if (action === "cancel_by_time") {
+      const searchStart = new Date(toBerlinISOString(date, time));
+      const searchEnd = new Date(searchStart.getTime() + 5 * 60000);
+
+      const events = await calendar.events.list({
+        calendarId: tech.calendarId,
+        timeMin: searchStart.toISOString(),
+        timeMax: searchEnd.toISOString(),
+        singleEvents: true,
+        timeZone: "Europe/Berlin",
+      });
+
+      const items = events.data.items || [];
+      if (items.length === 0) {
+        return Response.json({
+          success: false,
+          message: `Kein Termin gefunden`,
+        });
+      }
+
+      await calendar.events.delete({
+        calendarId: tech.calendarId,
+        eventId: items[0].id,
+      });
+
+      return Response.json({
+        success: true,
+        message: `Termin bei ${tech.name} am ${date} um ${time} storniert`,
+      });
+    }
+
+    if (action === "cancel" && body.eventId) {
+      await calendar.events.delete({
+        calendarId: tech.calendarId,
+        eventId: body.eventId,
+      });
+
+      return Response.json({
+        success: true,
+        message: `Termin storniert`,
+      });
+    }
+
+    return Response.json({ error: "Unknown action" }, { status: 400 });
+
+  } catch (error) {
+    console.error("Calendar API Error:", error.message);
+    return Response.json(
+      { error: "Calendar error: " + error.message },
+      { status: 500 }
+    );
+  }
+}        client_email,
         private_key,
       };
     }
