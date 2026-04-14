@@ -1,4 +1,3 @@
-
 import {
   findCustomerByPhone,
   upsertCustomer,
@@ -12,6 +11,9 @@ import {
 // FIX A1: System Prompt dùng đúng `system` parameter
 // FIX A2: Timezone động — tự tính CET/CEST theo ngày thực tế
 // FIX A3: Timestamp tin nhắn lưu đúng lúc gửi (xử lý ở frontend)
+// FIX A4: Validate ANTHROPIC_API_KEY trước khi gọi API
+// FIX A5: getBerlinOffset format đúng cho mọi offset
+// FIX A6: Graceful degradation khi Supabase chưa config
 // OPTION B: Real-time availability — inject lịch trống thực từ Google Calendar
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -39,11 +41,10 @@ const availabilityCache = {
 /**
  * Trả về offset múi giờ Berlin dưới dạng chuỗi "+HH:MM"
  * Berlin dùng CET (UTC+1) mùa đông, CEST (UTC+2) mùa hè.
- * Quy tắc EU: chuyển mùa hè vào Chủ nhật cuối tháng 3,
- *             chuyển mùa đông vào Chủ nhật cuối tháng 10.
+ *
+ * FIX A5: Dùng padStart thay vì +0 hardcode (tránh lỗi nếu offset >= 10)
  */
 function getBerlinOffset(date = new Date()) {
-  // Dùng Intl để lấy offset chính xác — không bao giờ sai dù DST
   const berlinFormatter = new Intl.DateTimeFormat("en-US", {
     timeZone: "Europe/Berlin",
     timeZoneName: "shortOffset",
@@ -51,10 +52,11 @@ function getBerlinOffset(date = new Date()) {
   const parts = berlinFormatter.formatToParts(date);
   const offsetPart = parts.find((p) => p.type === "timeZoneName")?.value ?? "GMT+2";
   // offsetPart ví dụ: "GMT+2" hoặc "GMT+1"
-  const match = offsetPart.match(/GMT([+-]\d+)/);
+  const match = offsetPart.match(/GMT([+-])(\d+)/);
   if (!match) return "+02:00";
-  const hours = parseInt(match[1]);
-  return hours >= 0 ? `+0${hours}:00` : `-0${Math.abs(hours)}:00`;
+  const sign = match[1];
+  const hours = match[2].padStart(2, "0");
+  return `${sign}${hours}:00`;
 }
 
 /**
@@ -120,7 +122,24 @@ Wenn ein Termin storniert wird (Kunde bestätigt Stornierung mit J), füge hinzu
 const GREETING =
   "Hallo! Willkommen bei Sakura Nails Hamburg 💅\nWie kann ich dir helfen?\n\n1️⃣ Termin buchen\n2️⃣ Termin ändern oder stornieren\n3️⃣ Services & Preise ansehen\n4️⃣ Treuepunkte checken\n5️⃣ Etwas anderes\n\nTippe einfach die Zahl 😊";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX A6: Helper kiểm tra Supabase có sẵn sàng không
+// Nếu Supabase chưa config → bỏ qua DB operations, chat vẫn hoạt động
+// ─────────────────────────────────────────────────────────────────────────────
+function isSupabaseConfigured() {
+  return !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
 export async function POST(request) {
+  // ─── FIX A4: Validate API key ngay đầu ──────────────────────────────────
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("❌ ANTHROPIC_API_KEY is not set!");
+    return Response.json(
+      { error: "Chat service not configured. Please set ANTHROPIC_API_KEY." },
+      { status: 500 }
+    );
+  }
+
   const { messages } = await request.json();
 
   // ─── Validate input ────────────────────────────────────────────────────────
@@ -162,7 +181,7 @@ export async function POST(request) {
 
     // ─────────────────────────────────────────────────────────────────────────
     // OPTION C: Lookup khách hàng theo SĐT — inject vào System Prompt
-    // Chatbot tự extract SĐT từ tin nhắn gần nhất nếu khách vừa báo
+    // FIX A6: Chỉ lookup nếu Supabase đã config
     // ─────────────────────────────────────────────────────────────────────────
     let customerPromptText = "AKTUELLER KUNDE: Unbekannt (Telefonnummer noch nicht angegeben)";
 
@@ -172,7 +191,7 @@ export async function POST(request) {
       /(?:(?:\+49|0049|0)[\s\-]?)?(?:1[5-7][0-9])[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{4,6}/
     );
 
-    if (phoneMatch) {
+    if (phoneMatch && isSupabaseConfigured()) {
       try {
         const customerUrl = new URL("/api/customer", request.url);
         customerUrl.searchParams.set("phone", phoneMatch[0]);
@@ -189,6 +208,10 @@ export async function POST(request) {
         console.warn("⚠️  Customer lookup failed:", custErr.message);
         // Không crash — chỉ không có customer context
       }
+    } else if (phoneMatch && !isSupabaseConfigured()) {
+      // SĐT có nhưng Supabase chưa config → ghi nhận nhưng không query
+      customerPromptText = `AKTUELLER KUNDE: Neue Nummer ${phoneMatch[0]} (Datenbank nicht konfiguriert)`;
+      console.warn("⚠️  Supabase not configured, skipping customer lookup");
     }
 
     // Inject cả availability + customer vào System Prompt
@@ -196,19 +219,14 @@ export async function POST(request) {
 
     // ─────────────────────────────────────────────────────────────────────────
     // FIX A1: Truyền System Prompt đúng cách qua `system` parameter
-    // Trước đây: nhét vào { role: "user" } → Claude xử lý như tin nhắn thường,
-    //           dễ bị override, tốn token hơn, context không tối ưu.
-    // Bây giờ:  dùng `system` riêng → Claude hiểu đây là chỉ thị cố định.
     // ─────────────────────────────────────────────────────────────────────────
 
     // Lọc chỉ lấy messages hợp lệ (role: user | assistant), bỏ greeting tĩnh
-    // vì greeting đã được inject ở frontend — không cần gửi lại lên API
     const apiMessages = messages
       .filter((m) => m.role === "user" || m.role === "assistant")
       .filter((m) => typeof m.content === "string" && m.content.trim() !== "");
 
     // Đảm bảo conversation bắt đầu bằng role "user" (yêu cầu của Anthropic API)
-    // Nếu message đầu là greeting của assistant, bỏ đi
     const firstUserIdx = apiMessages.findIndex((m) => m.role === "user");
     const cleanMessages = firstUserIdx >= 0 ? apiMessages.slice(firstUserIdx) : apiMessages;
 
@@ -216,6 +234,11 @@ export async function POST(request) {
     if (cleanMessages.length === 0) {
       return Response.json({ reply: GREETING });
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FIX A4: Log request info để debug (không log API key!)
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log(`🤖 Calling Claude API with ${cleanMessages.length} messages`);
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -234,11 +257,25 @@ export async function POST(request) {
 
     const data = await response.json();
 
+    // ─── FIX A4: Log chi tiết lỗi từ Anthropic API ──────────────────────────
     if (!response.ok) {
-      return Response.json(
-        { error: data?.error?.message || "API error" },
-        { status: 500 }
-      );
+      console.error("❌ Anthropic API error:", {
+        status: response.status,
+        type: data?.error?.type,
+        message: data?.error?.message,
+      });
+
+      // Trả error message rõ ràng hơn cho debug
+      const userMessage =
+        response.status === 401
+          ? "API key không hợp lệ. Vui lòng kiểm tra ANTHROPIC_API_KEY."
+          : response.status === 404
+          ? "Model không tồn tại hoặc không có quyền truy cập."
+          : response.status === 429
+          ? "Đã vượt quá giới hạn API. Vui lòng thử lại sau."
+          : data?.error?.message || "API error";
+
+      return Response.json({ error: userMessage }, { status: 500 });
     }
 
     let reply =
@@ -274,10 +311,9 @@ export async function POST(request) {
           const bookData = await bookRes.json();
           console.log("✅ Calendar booked:", bookData.message);
 
-          // ── OPTION C: Lưu booking vào Supabase ───────────────────────────
-          if (bookData.success) {
+          // ── OPTION C: Lưu booking vào Supabase (chỉ nếu đã config) ────
+          if (bookData.success && isSupabaseConfigured()) {
             try {
-              // Tìm hoặc tạo khách hàng
               const customerName = bookMatch[5];
               const phoneInText  = allText.match(
                 /(?:(?:\+49|0049|0)[\s\-]?)?(?:1[5-7][0-9])[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{4,6}/
@@ -292,8 +328,6 @@ export async function POST(request) {
                   });
                 }
 
-                // Tạo booking record
-                const techMap = { T01: "+4900000000001", T02: "+4900000000002", T03: "+4900000000003" };
                 const apptISO = new Date(`${bookMatch[2]}T${bookMatch[3]}:00+02:00`).toISOString();
 
                 await createBooking({
@@ -312,7 +346,6 @@ export async function POST(request) {
               console.error("❌ Supabase booking save failed:", dbErr.message);
             }
           }
-          // ─────────────────────────────────────────────────────────────────
         } catch (calErr) {
           console.error("❌ Calendar booking failed:", calErr.message);
         }
@@ -346,8 +379,8 @@ export async function POST(request) {
           const cancelData = await cancelRes.json();
           console.log("✅ Calendar cancelled:", cancelData.message);
 
-          // ── OPTION C: Cập nhật trạng thái booking trong Supabase ─────────
-          if (cancelData.success) {
+          // ── OPTION C: Cập nhật Supabase (chỉ nếu đã config) ──────────
+          if (cancelData.success && isSupabaseConfigured()) {
             try {
               const apptISO = new Date(`${cancelMatch[2]}T${cancelMatch[3]}:00+02:00`).toISOString();
               await cancelBookingByTime({
@@ -359,7 +392,6 @@ export async function POST(request) {
               console.error("❌ Supabase cancel failed:", dbErr.message);
             }
           }
-          // ─────────────────────────────────────────────────────────────────
         } catch (calErr) {
           console.error("❌ Calendar cancel failed:", calErr.message);
         }
@@ -375,7 +407,7 @@ export async function POST(request) {
     return Response.json({ reply });
 
   } catch (error) {
-    console.error("Server error:", error.message);
-    return Response.json({ error: "Server error" }, { status: 500 });
+    console.error("❌ Server error:", error.message, error.stack);
+    return Response.json({ error: "Server error: " + error.message }, { status: 500 });
   }
 }
